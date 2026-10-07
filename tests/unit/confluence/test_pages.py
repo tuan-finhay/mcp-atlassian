@@ -2412,175 +2412,247 @@ class TestMovePage:
             mixin.preprocessor = confluence_client.preprocessor
             return mixin
 
-    def test_move_page_to_new_parent_same_space(self, pages_mixin):
-        """Test moving a page to a new parent within the same space."""
-        page_id = "111"
-        target_parent_id = "222"
+    @staticmethod
+    def _install_tree(
+        pages_mixin: PagesMixin,
+        tree: dict[str, dict],
+        move_works: bool = True,
+    ) -> dict[str, dict]:
+        """Back get_page_by_id/move_page/put with an in-memory page tree.
 
-        # Mock get_page_by_id to return target page with space info
-        pages_mixin.confluence.get_page_by_id.return_value = {
-            "id": target_parent_id,
-            "title": "Target Parent",
-            "space": {"key": "PROJ", "name": "Project"},
-            "version": {"number": 1},
-            "body": {"storage": {"value": "<p>Parent content</p>"}},
-        }
+        ``tree`` maps page ID to {"parent": id|None, "space": key}.
+        """
 
-        # Mock move_page
-        pages_mixin.confluence.move_page.return_value = {"status": "ok"}
+        def get_page_by_id(page_id, expand=None, **_kwargs):
+            node = tree[str(page_id)]
+            ancestors = [{"id": node["parent"]}] if node["parent"] else []
+            return {
+                "id": str(page_id),
+                "type": "page",
+                "title": f"Page {page_id}",
+                "space": {"key": node["space"]},
+                "ancestors": ancestors,
+                "version": {"number": node.get("version", 1)},
+                "body": {"storage": {"value": f"<p>body {page_id}</p>"}},
+            }
 
-        # Mock get_page_content for the re-fetch after move
-        mock_moved_page = ConfluencePage(
+        def move_page(space_key, page_id, target_id=None, position="append"):
+            if not move_works:
+                return "<html>login</html>"
+            node = tree[str(page_id)]
+            if target_id is None:
+                node["parent"] = None
+            elif position == "append":
+                node["parent"] = str(target_id)
+            else:
+                node["parent"] = tree[str(target_id)]["parent"]
+            node["space"] = space_key
+            return None
+
+        def put(path, data=None, **_kwargs):
+            page_id = path.rsplit("/", 1)[-1]
+            node = tree[page_id]
+            node["parent"] = data["ancestors"][-1]["id"]
+            node["version"] = data["version"]["number"]
+            return {}
+
+        pages_mixin.confluence.get_page_by_id.side_effect = get_page_by_id
+        pages_mixin.confluence.move_page.side_effect = move_page
+        pages_mixin.confluence.put.side_effect = put
+        return tree
+
+    @staticmethod
+    def _moved_page(page_id: str, space_key: str = "PROJ") -> ConfluencePage:
+        return ConfluencePage(
             id=page_id,
             title="Moved Page",
             content="Moved content",
-            space={"key": "PROJ", "name": "Project"},
+            space={"key": space_key, "name": space_key},
             version={"number": 2},
         )
+
+    def test_move_page_to_new_parent_same_space(self, pages_mixin):
+        """A working movepage.action call is used and not followed by PUT."""
+        tree = self._install_tree(
+            pages_mixin,
+            {
+                "111": {"parent": "100", "space": "PROJ"},
+                "222": {"parent": "100", "space": "PROJ"},
+            },
+        )
         with patch.object(
-            pages_mixin, "get_page_content", return_value=mock_moved_page
+            pages_mixin, "get_page_content", return_value=self._moved_page("111")
         ):
-            result = pages_mixin.move_page(
-                page_id=page_id, target_parent_id=target_parent_id
+            result = pages_mixin.move_page(page_id="111", target_parent_id="222")
+
+        pages_mixin.confluence.move_page.assert_called_once_with(
+            "PROJ", "111", target_id="222", position="append"
+        )
+        pages_mixin.confluence.put.assert_not_called()
+        assert tree["111"]["parent"] == "222"
+        assert isinstance(result, ConfluencePage)
+        assert result.id == "111"
+
+    def test_move_page_falls_back_to_rest_when_action_is_ignored(self, pages_mixin):
+        """Regression: movepage.action returns 200 but does not move the page."""
+        tree = self._install_tree(
+            pages_mixin,
+            {
+                "111": {"parent": "100", "space": "PROJ", "version": 7},
+                "222": {"parent": "100", "space": "PROJ"},
+            },
+            move_works=False,
+        )
+        with patch.object(
+            pages_mixin, "get_page_content", return_value=self._moved_page("111")
+        ):
+            pages_mixin.move_page(page_id="111", target_parent_id="222")
+
+        pages_mixin.confluence.put.assert_called_once()
+        path = pages_mixin.confluence.put.call_args.args[0]
+        payload = pages_mixin.confluence.put.call_args.kwargs["data"]
+        assert path == "rest/api/content/111"
+        assert payload["ancestors"] == [{"type": "page", "id": "222"}]
+        assert payload["version"]["number"] == 8
+        assert payload["body"]["storage"]["value"] == "<p>body 111</p>"
+        assert payload["title"] == "Page 111"
+        assert tree["111"]["parent"] == "222"
+
+    def test_move_page_below_sibling_falls_back_to_sibling_parent(self, pages_mixin):
+        """'below' a sibling re-parents under that sibling's parent."""
+        tree = self._install_tree(
+            pages_mixin,
+            {
+                "111": {"parent": "100", "space": "PROJ"},
+                "333": {"parent": "300", "space": "PROJ"},
+            },
+            move_works=False,
+        )
+        with patch.object(
+            pages_mixin, "get_page_content", return_value=self._moved_page("111")
+        ):
+            pages_mixin.move_page(
+                page_id="111", target_parent_id="333", position="below"
             )
 
-        # Verify move_page was called with the correct space_key from the target
-        pages_mixin.confluence.move_page.assert_called_once_with(
-            "PROJ", page_id, target_id=target_parent_id, position="append"
+        payload = pages_mixin.confluence.put.call_args.kwargs["data"]
+        assert payload["ancestors"] == [{"type": "page", "id": "300"}]
+        assert tree["111"]["parent"] == "300"
+
+    def test_move_page_with_above_position(self, pages_mixin):
+        """Test moving a page with 'above' position (sibling ordering)."""
+        tree = self._install_tree(
+            pages_mixin,
+            {
+                "111": {"parent": "100", "space": "PROJ"},
+                "222": {"parent": "200", "space": "PROJ"},
+            },
         )
+        with patch.object(
+            pages_mixin, "get_page_content", return_value=self._moved_page("111")
+        ):
+            result = pages_mixin.move_page(
+                page_id="111", target_parent_id="222", position="above"
+            )
+
+        pages_mixin.confluence.move_page.assert_called_once_with(
+            "PROJ", "111", target_id="222", position="above"
+        )
+        pages_mixin.confluence.put.assert_not_called()
+        assert tree["111"]["parent"] == "200"
         assert isinstance(result, ConfluencePage)
-        assert result.id == page_id
 
     def test_move_page_to_different_space_root(self, pages_mixin):
         """Test moving a page to the root of a different space."""
-        page_id = "111"
-        target_space_key = "NEWSPACE"
-
-        # Mock move_page
-        pages_mixin.confluence.move_page.return_value = {"status": "ok"}
-
-        # Mock get_page_content for the re-fetch after move
-        mock_moved_page = ConfluencePage(
-            id=page_id,
-            title="Moved Page",
-            content="Moved content",
-            space={"key": target_space_key, "name": "New Space"},
-            version={"number": 2},
-        )
+        self._install_tree(pages_mixin, {"111": {"parent": "100", "space": "PROJ"}})
         with patch.object(
-            pages_mixin, "get_page_content", return_value=mock_moved_page
+            pages_mixin,
+            "get_page_content",
+            return_value=self._moved_page("111", "NEWSPACE"),
         ):
-            result = pages_mixin.move_page(
-                page_id=page_id, target_space_key=target_space_key
-            )
+            result = pages_mixin.move_page(page_id="111", target_space_key="NEWSPACE")
 
-        # Verify move_page was called with target_space_key and no target_id
         pages_mixin.confluence.move_page.assert_called_once_with(
-            target_space_key, page_id, target_id=None, position="append"
+            "NEWSPACE", "111", target_id=None, position="append"
         )
-        assert isinstance(result, ConfluencePage)
-        assert result.space.key == target_space_key
+        assert result.space.key == "NEWSPACE"
 
     def test_move_page_with_both_parent_and_space(self, pages_mixin):
         """Test moving a page with both target_parent_id and target_space_key."""
-        page_id = "111"
-        target_parent_id = "333"
-        target_space_key = "OTHERSPACE"
-
-        # Mock move_page
-        pages_mixin.confluence.move_page.return_value = {"status": "ok"}
-
-        # Mock get_page_content for the re-fetch after move
-        mock_moved_page = ConfluencePage(
-            id=page_id,
-            title="Cross-Space Moved",
-            content="Moved content",
-            space={"key": target_space_key, "name": "Other Space"},
-            version={"number": 2},
+        self._install_tree(
+            pages_mixin,
+            {
+                "111": {"parent": "100", "space": "PROJ"},
+                "333": {"parent": None, "space": "OTHERSPACE"},
+            },
         )
         with patch.object(
-            pages_mixin, "get_page_content", return_value=mock_moved_page
+            pages_mixin,
+            "get_page_content",
+            return_value=self._moved_page("111", "OTHERSPACE"),
         ):
             result = pages_mixin.move_page(
-                page_id=page_id,
-                target_parent_id=target_parent_id,
-                target_space_key=target_space_key,
+                page_id="111",
+                target_parent_id="333",
+                target_space_key="OTHERSPACE",
             )
 
-        # When both are given, use target_space_key directly (no need to look up)
         pages_mixin.confluence.move_page.assert_called_once_with(
-            target_space_key, page_id, target_id=target_parent_id, position="append"
+            "OTHERSPACE", "111", target_id="333", position="append"
         )
-        assert isinstance(result, ConfluencePage)
-        assert result.space.key == target_space_key
+        assert result.space.key == "OTHERSPACE"
+
+    def test_move_page_cross_space_ignored_raises(self, pages_mixin):
+        """A silently ignored cross-space move is reported, not faked."""
+        self._install_tree(
+            pages_mixin,
+            {
+                "111": {"parent": "100", "space": "PROJ"},
+                "333": {"parent": None, "space": "OTHERSPACE"},
+            },
+            move_works=False,
+        )
+        with pytest.raises(Exception, match="did not move page 111"):
+            pages_mixin.move_page(
+                page_id="111",
+                target_parent_id="333",
+                target_space_key="OTHERSPACE",
+            )
+        pages_mixin.confluence.put.assert_not_called()
+
+    def test_move_page_raises_when_fallback_does_not_stick(self, pages_mixin):
+        """If even the REST update leaves the parent unchanged, raise."""
+        self._install_tree(
+            pages_mixin,
+            {
+                "111": {"parent": "100", "space": "PROJ"},
+                "222": {"parent": "100", "space": "PROJ"},
+            },
+            move_works=False,
+        )
+        pages_mixin.confluence.put.side_effect = lambda *a, **k: {}
+        with pytest.raises(Exception, match="expected 222"):
+            pages_mixin.move_page(page_id="111", target_parent_id="222")
 
     def test_move_page_validation_error_neither_provided(self, pages_mixin):
         """Test that ValueError is raised when neither target is provided."""
         with pytest.raises(ValueError, match="At least one of"):
             pages_mixin.move_page(page_id="111")
 
-    def test_move_page_with_above_position(self, pages_mixin):
-        """Test moving a page with 'above' position (sibling ordering)."""
-        page_id = "111"
-        target_parent_id = "222"
-
-        pages_mixin.confluence.get_page_by_id.return_value = {
-            "id": target_parent_id,
-            "title": "Target Parent",
-            "space": {"key": "PROJ", "name": "Project"},
-            "version": {"number": 1},
-            "body": {"storage": {"value": "<p>content</p>"}},
-        }
-        pages_mixin.confluence.move_page.return_value = {"status": "ok"}
-
-        mock_moved_page = ConfluencePage(
-            id=page_id,
-            title="Moved Above Page",
-            content="Content",
-            space={"key": "PROJ", "name": "Project"},
-            version={"number": 2},
-        )
-        with patch.object(
-            pages_mixin, "get_page_content", return_value=mock_moved_page
-        ):
-            result = pages_mixin.move_page(
-                page_id=page_id,
-                target_parent_id=target_parent_id,
-                position="above",
-            )
-
-        pages_mixin.confluence.move_page.assert_called_once_with(
-            "PROJ", page_id, target_id=target_parent_id, position="above"
-        )
-        assert isinstance(result, ConfluencePage)
-
     def test_move_page_api_error(self, pages_mixin):
         """Test that API errors are propagated correctly."""
-        page_id = "111"
-        target_space_key = "BADSPACE"
-
+        pages_mixin.confluence.get_page_by_id.side_effect = None
         pages_mixin.confluence.move_page.side_effect = Exception(
             "API error: space not found"
         )
 
         with pytest.raises(Exception, match="Failed to move page"):
-            pages_mixin.move_page(page_id=page_id, target_space_key=target_space_key)
+            pages_mixin.move_page(page_id="111", target_space_key="BADSPACE")
 
     def test_move_page_uses_v2_adapter_for_oauth(self, pages_mixin):
         """Test that move_page uses v2 adapter for OAuth authentication."""
-        page_id = "111"
-        target_parent_id = "222"
-
         mock_v2_adapter = MagicMock()
         mock_v2_adapter.move_page.return_value = None
-
-        mock_moved_page = ConfluencePage(
-            id=page_id,
-            title="OAuth Moved Page",
-            content="Content",
-            space={"key": "PROJ", "name": "Project"},
-            version={"number": 2},
-        )
 
         with (
             patch.object(
@@ -2588,18 +2660,16 @@ class TestMovePage:
                 "_v2_adapter",
                 new_callable=lambda: property(lambda self: mock_v2_adapter),
             ),
-            patch.object(pages_mixin, "get_page_content", return_value=mock_moved_page),
+            patch.object(
+                pages_mixin, "get_page_content", return_value=self._moved_page("111")
+            ),
         ):
-            result = pages_mixin.move_page(
-                page_id=page_id,
-                target_parent_id=target_parent_id,
-            )
+            result = pages_mixin.move_page(page_id="111", target_parent_id="222")
 
-        # v2 adapter should be called instead of confluence.move_page
         mock_v2_adapter.move_page.assert_called_once_with(
-            page_id=page_id,
+            page_id="111",
             position="append",
-            target_id=target_parent_id,
+            target_id="222",
         )
         pages_mixin.confluence.move_page.assert_not_called()
         assert isinstance(result, ConfluencePage)

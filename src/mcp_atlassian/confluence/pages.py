@@ -1472,18 +1472,10 @@ class PagesMixin(ConfluenceClient):
                     target_id=target_parent_id,
                 )
             else:
-                # Determine space_key for the move_page call
-                if target_space_key:
-                    space_key = target_space_key
-                else:
-                    # Look up the target parent's space key
-                    target_page = self.confluence.get_page_by_id(target_parent_id)
-                    space_key = target_page.get("space", {}).get("key", "")
-
-                self.confluence.move_page(
-                    space_key,
-                    page_id,
-                    target_id=target_parent_id,
+                self._move_page_legacy(
+                    page_id=page_id,
+                    target_parent_id=target_parent_id,
+                    target_space_key=target_space_key,
                     position=position,
                 )
 
@@ -1496,6 +1488,135 @@ class PagesMixin(ConfluenceClient):
         except Exception as e:
             logger.error(f"Error moving page {page_id}: {str(e)}")
             raise Exception(f"Failed to move page {page_id}: {str(e)}") from e
+
+    def _get_parent_and_space(self, page_id: str) -> tuple[str | None, str]:
+        """Return the direct parent ID and space key of a page.
+
+        Args:
+            page_id: ID of the page to inspect.
+
+        Returns:
+            Tuple of (parent page ID or None for a top-level page, space key).
+        """
+        page = self.confluence.get_page_by_id(page_id, expand="ancestors,space")
+        ancestors = page.get("ancestors") or []
+        parent_id = str(ancestors[-1].get("id")) if ancestors else None
+        space_key = str(page.get("space", {}).get("key", ""))
+        return parent_id, space_key
+
+    def _move_page_legacy(
+        self,
+        page_id: str,
+        target_parent_id: str | None,
+        target_space_key: str | None,
+        position: str,
+    ) -> None:
+        """Move a page without OAuth, verifying the result.
+
+        ``atlassian-python-api`` moves pages through the web UI endpoint
+        ``/pages/movepage.action``. On Server/Data Center with token auth that
+        endpoint can answer HTTP 200 (a login or error page) without moving
+        anything, so the outcome is verified by re-reading the page's parent.
+        When the page did not move and the target stays in the same space,
+        the parent is changed through ``PUT /rest/api/content/{id}`` instead,
+        keeping the page body unchanged.
+
+        Args:
+            page_id: ID of the page to move.
+            target_parent_id: Target page ID (parent for "append", sibling
+                for "above"/"below").
+            target_space_key: Target space key for cross-space moves.
+            position: "append", "above" or "below".
+
+        Raises:
+            Exception: If the page could not be moved.
+        """
+        expected_parent: str | None = None
+        if target_parent_id:
+            if position == "append":
+                expected_parent = str(target_parent_id)
+                target_space = self._get_parent_and_space(target_parent_id)[1]
+            else:
+                expected_parent, target_space = self._get_parent_and_space(
+                    target_parent_id
+                )
+        else:
+            target_space = ""
+        space_key = target_space_key or target_space
+
+        try:
+            self.confluence.move_page(
+                space_key,
+                page_id,
+                target_id=target_parent_id,
+                position=position,
+            )
+        except HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status in (401, 403):
+                raise
+            logger.warning(
+                f"movepage.action failed for page {page_id} ({e}); "
+                "falling back to REST parent update"
+            )
+
+        current_parent, current_space = self._get_parent_and_space(page_id)
+        moved = current_space == space_key and (
+            not target_parent_id or current_parent == expected_parent
+        )
+        if moved:
+            return
+
+        same_space = not target_space_key or target_space_key == current_space
+        if not (expected_parent and same_space):
+            raise Exception(
+                f"Confluence did not move page {page_id} (parent is still "
+                f"{current_parent} in space {current_space}). Moving to a space "
+                "root or across spaces is not supported by the fallback."
+            )
+
+        logger.info(
+            f"movepage.action did not move page {page_id}; "
+            f"setting parent {expected_parent} via REST"
+        )
+        self._set_page_parent(page_id, expected_parent)
+
+        current_parent, _ = self._get_parent_and_space(page_id)
+        if current_parent != expected_parent:
+            raise Exception(
+                f"Confluence did not move page {page_id}: parent is "
+                f"{current_parent}, expected {expected_parent}"
+            )
+
+    def _set_page_parent(self, page_id: str, parent_id: str) -> None:
+        """Change a page's parent via the REST API, keeping its content.
+
+        Args:
+            page_id: ID of the page to re-parent.
+            parent_id: ID of the new parent page.
+        """
+        page = self.confluence.get_page_by_id(
+            page_id, expand="body.storage,version,space"
+        )
+        payload = {
+            "id": page_id,
+            "type": page.get("type", "page"),
+            "title": page["title"],
+            "space": {"key": page["space"]["key"]},
+            "body": {
+                "storage": {
+                    "value": page["body"]["storage"]["value"],
+                    "representation": "storage",
+                }
+            },
+            "version": {
+                "number": int(page["version"]["number"]) + 1,
+                "minorEdit": True,
+                "message": "Moved page",
+            },
+            "ancestors": [{"type": "page", "id": parent_id}],
+        }
+        self.confluence.put(f"rest/api/content/{page_id}", data=payload)
 
     @handle_auth_errors("Confluence API")
     def get_page_version_diff(
